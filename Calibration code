@@ -1,0 +1,105 @@
+Calibration code
+
+#include <Arduino.h>
+#include "HX711.h"
+
+const int LOADCELL_DOUT_PIN = 21;  // DT
+const int LOADCELL_SCK_PIN = 22;   // SCK
+
+HX711 scale;
+
+// Enter the weight of your known calibration object in grams
+float known_weight = 250.0;
+
+void setup() {
+
+  Serial.begin(115200);
+
+  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+
+  Serial.println("Starting HX711...");
+  delay(1000);
+
+  if (!scale.is_ready()) {
+    Serial.println("HX711 not found!");
+
+  // Remove everything from the load cell
+  Serial.println();
+    while (1);
+  }
+
+  Serial.println("HX711 connected.");
+  Serial.println("Remove all weight from the load cell.");
+  Serial.println("Taring in 5 seconds...");
+
+  delay(5000);
+
+  scale.set_scale();
+  scale.tare();
+
+  Serial.println("Tare complete.");
+  Serial.println();
+
+  // Ask user to place known weight
+  Serial.print("Place ");
+  Serial.print(known_weight);
+  Serial.println(" g known weight on the load cell.");
+
+  Serial.println("Measuring in 5 seconds...");
+  delay(5000);
+
+  // Get raw reading with known weight
+  long raw_reading = scale.get_value(20);
+
+  // Calculate calibration factor
+  float calibration_factor = raw_reading / known_weight;
+
+  Serial.println();
+  Serial.println("========== CALIBRATION ==========");
+  Serial.print("Raw reading: ");
+  Serial.println(raw_reading);
+
+  Serial.print("Known weight: ");
+  Serial.print(known_weight);
+  Serial.println(" g");
+
+  Serial.print("Calibration factor = ");
+  Serial.println(calibration_factor, 4);
+
+  Serial.println("=================================");
+  Serial.println();
+
+  // Apply calibration factor
+  scale.set_scale(calibration_factor);
+
+  Serial.println("Calibration complete!");
+  Serial.println("Remove the calibration weight.");
+  delay(3000);
+
+  Serial.println("Now place your object on the load cell.");
+  Serial.println();
+}
+
+void loop() {
+
+  if (scale.is_ready()) {
+
+    float weight = scale.get_units(10);
+
+    // Remove tiny negative values caused by noise
+    if (weight < 0 && weight > -5) {
+      weight = 0;
+    }
+
+    Serial.print("Weight: ");
+    Serial.print(weight, 2);
+    Serial.println(" g");
+
+  } else {
+
+    Serial.println("HX711 not found!");
+
+  }
+
+  delay(500);
+}
