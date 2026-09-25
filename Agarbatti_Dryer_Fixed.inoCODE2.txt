@@ -1,0 +1,319 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include "HX711.h"
+#include <DHT.h>
+#include <LiquidCrystal_I2C.h>
+
+// ---------------- Pin map (from wiring notes) ----------------
+const int LOADCELL_DOUT_PIN = 21;   // HX711 DT
+const int LOADCELL_SCK_PIN  = 22;   // HX711 SCK
+
+const int LCD_SDA_PIN = 13;
+const int LCD_SCL_PIN = 14;
+
+const int DHT1_PIN = 4;
+const int DHT2_PIN = 5;
+#define DHTTYPE DHT22
+
+const int BUZZER_PIN = 33;
+const int BUTTON_PIN = 32;          // other leg to GND, use internal pull-up
+
+const int RELAY_HEATER_PIN = 25;    // Relay 1
+const int RELAY_FAN_PIN    = 26;    // Relay 2
+
+// Most cheap relay modules are ACTIVE-LOW (LOW = energised = contact closed).
+// If your relays turn ON when the pin goes HIGH instead, flip this to false.
+const bool RELAY_ACTIVE_LOW = true;
+
+// ---------------- Tunables ----------------
+float calibration_factor   = 451.8080;   // from your earlier calibration run
+float target_weight_loss_pct = 80.0;     // stop drying once this much moisture is gone
+const float MAX_SAFE_TEMP_C  = 60.0;     // heater safety cutoff
+const unsigned long DHT_READ_INTERVAL_MS = 2500; // DHT22 needs >=2s between reads
+
+// ---------------- Objects ----------------
+HX711 scale;
+DHT dht1(DHT1_PIN, DHTTYPE);
+DHT dht2(DHT2_PIN, DHTTYPE);
+LiquidCrystal_I2C lcd(0x27, 16, 2);   // change to 0x3F if 0x27 doesn't work
+
+// ---------------- State machine ----------------
+enum SystemState { STATE_IDLE, STATE_WAIT_FOR_WEIGHT, STATE_DRYING, STATE_DONE };
+SystemState state = STATE_IDLE;
+
+float initial_wet_weight = 0.0;
+float current_weight     = 0.0;
+float weight_loss_pct    = 0.0;
+
+// ---- weight-settle detection (used when waiting for the batch to be placed) ----
+const float WEIGHT_DETECT_THRESHOLD = 5.0;   // grams - minimum to consider "something placed"
+const float WEIGHT_STABLE_TOLERANCE = 2.0;   // grams - max drift between reads to call it "settled"
+const int   WEIGHT_STABLE_COUNT     = 3;     // consecutive stable reads required
+float lastWeightReading = 0.0;
+int   weightStableCount = 0;
+
+float lastTempC = NAN;
+float lastHum   = NAN;
+unsigned long lastDhtReadMs = 0;
+
+// button debounce
+bool lastButtonReading = HIGH;
+bool buttonState = HIGH;
+unsigned long lastDebounceMs = 0;
+const unsigned long DEBOUNCE_MS = 50;
+
+unsigned long lastPrintMs = 0;
+const unsigned long PRINT_INTERVAL_MS = 1000;
+
+// ---------------- Helpers ----------------
+void relayWrite(int pin, bool on) {
+  if (RELAY_ACTIVE_LOW) {
+    digitalWrite(pin, on ? LOW : HIGH);
+  } else {
+    digitalWrite(pin, on ? HIGH : LOW);
+  }
+}
+
+void buzzerBeep(int times, int onMs, int offMs) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(onMs);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(offMs);
+  }
+}
+
+// Reads both DHT22 sensors, averages valid readings, updates lastTempC/lastHum.
+void updateDHT() {
+  if (millis() - lastDhtReadMs < DHT_READ_INTERVAL_MS) return;
+  lastDhtReadMs = millis();
+
+  float t1 = dht1.readTemperature();
+  float h1 = dht1.readHumidity();
+  float t2 = dht2.readTemperature();
+  float h2 = dht2.readHumidity();
+
+  float tSum = 0, hSum = 0;
+  int tCount = 0, hCount = 0;
+
+  if (!isnan(t1)) { tSum += t1; tCount++; }
+  if (!isnan(t2)) { tSum += t2; tCount++; }
+  if (!isnan(h1)) { hSum += h1; hCount++; }
+  if (!isnan(h2)) { hSum += h2; hCount++; }
+
+  lastTempC = (tCount > 0) ? (tSum / tCount) : NAN;
+  lastHum   = (hCount > 0) ? (hSum / hCount) : NAN;
+}
+
+// Returns true on a fresh press (falling edge), debounced.
+bool buttonPressed() {
+  bool reading = digitalRead(BUTTON_PIN);
+
+  if (reading != lastButtonReading) {
+    lastDebounceMs = millis();
+  }
+
+  bool pressedEdge = false;
+  if ((millis() - lastDebounceMs) > DEBOUNCE_MS) {
+    if (reading != buttonState) {
+      buttonState = reading;
+      if (buttonState == LOW) {
+        pressedEdge = true;
+      }
+    }
+  }
+  lastButtonReading = reading;
+  return pressedEdge;
+}
+
+void updateLCD() {
+  lcd.setCursor(0, 0);
+  lcd.print("                "); // clear line
+  lcd.setCursor(0, 0);
+
+  if (state == STATE_IDLE) {
+    lcd.print("Press btn: start");
+  } else if (state == STATE_WAIT_FOR_WEIGHT) {
+    lcd.print("Place agarbatti");
+  } else if (state == STATE_DRYING) {
+    lcd.print("Loss:");
+    lcd.print(weight_loss_pct, 1);
+    lcd.print("% ");
+  } else {
+    lcd.print("Drying complete");
+  }
+
+  lcd.setCursor(0, 1);
+  lcd.print("                "); // clear line
+  lcd.setCursor(0, 1);
+  if (isnan(lastTempC) || isnan(lastHum)) {
+    lcd.print("Sensor error");
+  } else {
+    lcd.print("T:");
+    lcd.print(lastTempC, 1);
+    lcd.print("C H:");
+    lcd.print(lastHum, 0);
+    lcd.print("%");
+  }
+}
+
+void setOutputs(bool heaterOn, bool fanOn) {
+  // Safety cutoff: never let the heater stay on above MAX_SAFE_TEMP_C
+  if (!isnan(lastTempC) && lastTempC >= MAX_SAFE_TEMP_C) {
+    heaterOn = false;
+  }
+  relayWrite(RELAY_HEATER_PIN, heaterOn);
+  relayWrite(RELAY_FAN_PIN, fanOn);
+}
+
+// ---------------- Setup ----------------
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  pinMode(RELAY_HEATER_PIN, OUTPUT);
+  pinMode(RELAY_FAN_PIN, OUTPUT);
+  setOutputs(false, false); // both off at boot
+
+  Wire.begin(LCD_SDA_PIN, LCD_SCL_PIN);
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Agarbatti Dryer");
+  lcd.setCursor(0, 1);
+  lcd.print("Initialising...");
+
+  dht1.begin();
+  dht2.begin();
+
+  Serial.println("Starting HX711...");
+  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+
+  if (!scale.is_ready()) {
+    Serial.println("HX711 not found!");
+    lcd.clear();
+    lcd.print("HX711 error!");
+    while (1);
+  }
+
+  Serial.println("HX711 connected.");
+  Serial.println("Keep the tray empty.");
+  Serial.println("Taring in 5 seconds...");
+  lcd.clear();
+  lcd.print("Keep tray empty");
+  lcd.setCursor(0, 1);
+  lcd.print("Taring...");
+  delay(5000);
+
+  scale.set_scale(calibration_factor);
+  scale.tare();
+  Serial.println("Tare complete.");
+
+  lcd.clear();
+  lcd.print("Place agarbatti");
+  lcd.setCursor(0, 1);
+  lcd.print("Press btn:start");
+
+  delay(1500);
+  updateDHT(); // prime first reading
+}
+
+// ---------------- Loop ----------------
+void loop() {
+  updateDHT();
+  bool pressed = buttonPressed();
+
+  switch (state) {
+
+    case STATE_IDLE:
+      setOutputs(false, false);
+      if (pressed) {
+        if (scale.is_ready()) {
+          Serial.println("Place the agarbatti now - waiting for it to settle...");
+          lastWeightReading = 0.0;
+          weightStableCount = 0;
+          state = STATE_WAIT_FOR_WEIGHT;
+        } else {
+          Serial.println("HX711 not ready, try again.");
+        }
+      }
+      break;
+
+    case STATE_WAIT_FOR_WEIGHT:
+      if (scale.is_ready()) {
+        float w = scale.get_units(10);
+        if (w < 0 && w > -5) w = 0;   // same noise clamp used elsewhere
+
+        if (w >= WEIGHT_DETECT_THRESHOLD) {
+          if (fabs(w - lastWeightReading) <= WEIGHT_STABLE_TOLERANCE) {
+            weightStableCount++;
+          } else {
+            weightStableCount = 0;
+          }
+          lastWeightReading = w;
+
+          if (weightStableCount >= WEIGHT_STABLE_COUNT) {
+            initial_wet_weight = w;
+            current_weight = w;
+            weight_loss_pct = 0.0;
+            Serial.print("Initial wet weight = ");
+            Serial.print(initial_wet_weight, 2);
+            Serial.println(" g");
+            state = STATE_DRYING;
+            buzzerBeep(1, 150, 0);   // short confirm beep
+          }
+        } else {
+          weightStableCount = 0;
+          lastWeightReading = w;
+        }
+      }
+      break;
+
+    case STATE_DRYING:
+      if (scale.is_ready()) {
+        current_weight = scale.get_units(10);
+        if (current_weight < 0 && current_weight > -5) current_weight = 0;
+
+        if (initial_wet_weight > 0) {
+          weight_loss_pct = ((initial_wet_weight - current_weight) / initial_wet_weight) * 100.0;
+          if (weight_loss_pct < 0) weight_loss_pct = 0;
+        }
+      }
+
+      setOutputs(true, true); // heater + fan ON while drying (subject to safety cutoff)
+
+      if (weight_loss_pct >= target_weight_loss_pct) {
+        state = STATE_DONE;
+      }
+      break;
+
+    case STATE_DONE:
+      setOutputs(false, false); // heater + fan OFF once dry
+      buzzerBeep(3, 200, 200);  // alert pattern once
+      delay(1000);
+      break;
+  }
+
+  updateLCD();
+
+  if (millis() - lastPrintMs >= PRINT_INTERVAL_MS) {
+    lastPrintMs = millis();
+    Serial.print("State: ");
+    Serial.print(state);
+    Serial.print(" | WeightLoss%: ");
+    Serial.print(weight_loss_pct, 1);
+    Serial.print(" | Temp: ");
+    Serial.print(isnan(lastTempC) ? -999 : lastTempC);
+    Serial.print(" | Hum: ");
+    Serial.print(isnan(lastHum) ? -999 : lastHum);
+    Serial.print(" | Heater: ");
+    Serial.print((state == STATE_DRYING) ? 1 : 0);
+    Serial.print(" | Fan: ");
+    Serial.println((state == STATE_DRYING) ? 1 : 0);
+  }
+
+  delay(50);
+}

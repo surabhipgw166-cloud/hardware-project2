@@ -1,0 +1,135 @@
+# SolAroma – Smart Solar Drying & Packaging System
+
+**Smart India Hackathon 2026 | Problem Statement ID: SIH26022**
+**Team: Tech Fusion**
+
+A solar-powered, ESP32-controlled drying chamber and heat-sealing system built to support home-based agarbatti (incense stick) production by rural women artisans.
+
+## Problem Statement
+
+> Design and develop a smart, solar-powered drying and compact packaging system to support home-based agarbatti manufacturing by rural women artisans.
+
+**Theme:** Agriculture, FoodTech & Rural Development · **Category:** Hardware
+
+Traditional open-air drying is weather-dependent and causes uneven drying, fragrance loss, moisture/fungal spoilage, and stick breakage — all of which hurt product quality and artisan income.
+
+## How It Works
+
+1. **Weight-based dryness detection** — a load cell continuously tracks the wet agarbatti's weight (instead of just inferring dryness from chamber air), so the system knows the *product's* real moisture loss.
+2. **Adaptive drying** — dual DHT22 sensors monitor chamber temperature/humidity; the heater runs on a duty cycle (since the 10W solar panel can't sustain it continuously) until both the weight-loss and temperature/humidity conditions confirm the batch is dry.
+3. **Dry → verify → pack interlock** — the sealing relay is software-locked and only fires once the system reaches a confirmed-dry state *and* the operator presses the push button, preventing premature sealing and spoilage.
+4. **HMI feedback** — a 16×2 I2C LCD shows live status, and a buzzer signals drying-complete (3 beeps) and sealing-complete (2 beeps).
+5. **Solar-DC hybrid power** — the whole rig runs off a 10W solar panel + 12V battery, no grid or inverter required.
+
+## System Architecture
+
+![System block diagram](images/system-block-diagram.png)
+
+Power flows left → right through the power chain; the ESP32 reads all sensors, drives the three relays (heater, fan, sealer) and the HMI, and serves a WiFi web dashboard.
+
+## Bill of Materials
+
+| # | Component | Spec / Qty | Sub-system | Role |
+|---|---|---|---|---|
+| 1 | Solar panel | 10 W | Power | Primary energy source |
+| 2 | Solar charge controller | 1 | Power | Regulates panel output, protects battery |
+| 3 | Battery | 12V 7Ah SLA | Power | Energy storage / all-weather backup |
+| 4 | ESP32 dev board | 1 | Control | Main controller + WiFi web server |
+| 5 | Buck converter | 12V→5V | Power | Steps battery voltage down for logic |
+| 6 | DHT22 sensor | ×2 | Sensing | Chamber temperature & humidity (dual point) |
+| 7 | Load cell | 1 (with tray) | Sensing | Weighs the drying batch |
+| 8 | HX711 module | 1 | Sensing | Load cell amplifier / ADC |
+| 9 | Relay module | ×3 | Actuation | Switches heater, fan, and sealer |
+| 10 | TEC1-12706 Peltier module | 5–9 W | Drying | Chamber heat source |
+| 11 | DC fan | 12V, 0.15A | Drying | Airflow / exhaust for even drying |
+| 12 | I2C LCD | 16×2 | HMI | Live status display |
+| 13 | Push button | 1 | HMI | Start drying / start sealing |
+| 14 | Buzzer | 1 | HMI | Drying-complete & seal-complete alerts |
+| 15 | Switch (SPST) | 1 | Power | Master ON/OFF for the 12V bus |
+| 16 | Wires | As needed | — | Interconnects |
+| 17 | Connectors | As needed | — | Terminal blocks / JST / screw terminals |
+| 18 | Heat-seal element (nichrome strip / impulse sealer bar) | 1 | Sealing | Heat source for the sealer, driven by Relay 3 |
+
+## Power Wiring
+
+| From | To | Notes |
+|---|---|---|
+| Solar panel (+/-) | Solar charge controller PV input | Match polarity; MC4 or screw-terminal connectors |
+| Charge controller BATT out | Battery 12V 7Ah | Controller prevents overcharge/deep discharge |
+| Battery (+) | Main switch (SPST) input | Single point of total shutdown for the whole rig |
+| Main switch output | 12V distribution bus | Feeds buck converter AND all 3 relay COM terminals |
+| 12V bus | Buck converter IN | Buck converter set to 5V output |
+| Buck converter OUT (5V) | ESP32 VIN/5V, HX711 VCC, LCD VCC, Relay module VCC, Buzzer VCC | Common 5V logic rail |
+| All GNDs | Common ground point | Battery(-), buck GND, ESP32 GND, relay GND, sensor GNDs, LCD GND must all tie together |
+
+**Safety:** fuse the 12V line right after the battery (2–3A blade fuse). Never share the 5V logic rail with the 12V actuator rail directly — only the relay coils/opto-inputs are 5V; the switched heater/fan/sealer loads stay on 12V through the relay's NO contact.
+
+## ESP32 Pin Map
+
+| Signal | GPIO | Connects to | Notes |
+|---|---|---|---|
+| DHT22 #1 data | 4 | Lower chamber sensor (near trays) | 10kΩ pull-up to 3.3V if not already on the module |
+| DHT22 #2 data | 5 | Upper chamber sensor (near exhaust) | Second point improves airflow-uniformity accuracy |
+| HX711 DT | 21 | HX711 module | Load-cell data |
+| HX711 SCK | 22 | HX711 module | Load-cell clock |
+| I2C SDA | 13 | LCD SDA | Default ESP32 I2C pin |
+| I2C SCL | 14 | LCD SCL | Default ESP32 I2C pin |
+| Relay 1 IN | 25 | Heater relay module | Active-LOW trigger |
+| Relay 2 IN | 26 | Fan relay module | Active-LOW trigger |
+| Relay 3 IN | 27 | Sealer relay module | Active-LOW trigger |
+| Push button | 32 | One leg of button; other leg to GND | INPUT_PULLUP in code |
+| Buzzer | 33 | Active buzzer module (+) | Buzzer (–) to GND |
+
+The load cell (4-wire: E+, E-, A+, A-) connects to the HX711 module's screw terminals, not directly to the ESP32 — the HX711 is the amplifier/ADC in between.
+
+## Sub-system Wiring Notes
+
+**Drying:**
+- DHT22 #1 mounted near the bottom tray (closest to the heater), DHT22 #2 near the top/exhaust — averaging both gives a truer chamber reading and confirms uniform airflow.
+- Load cell sits under the tray stack; keep wiring to the HX711 short (<20 cm), twisted-pair if possible.
+- Heater (+) → Relay 1 NO contact → 12V bus; Heater (–) → common ground.
+- Fan: same pattern via Relay 2. Since the fan motor is inductive, add a 1N4007 flyback diode across the fan terminals if the relay module doesn't already include one.
+
+**Sealing (Relay 3):**
+- A nichrome resistance wire strip or small impulse-sealer bar mounted across a PTFE-taped sealing bar is the heat-seal mechanism.
+- Wired like the heater: strip (+) → Relay 3 NO contact → 12V bus; strip (–) → common ground.
+- Mechanically, a simple hinged/spring-loaded clamp presses the filled pouch against the heated strip — no extra electronics needed for the demo prototype.
+- Software-interlocked: Relay 3 only fires after the system reaches the dry-confirmed state **and** the operator presses the push button.
+
+**HMI:**
+- 16×2 I2C LCD: VCC→5V, GND→GND, SDA→GPIO13, SCL→GPIO14 — shows live state, weight-loss %, temp/RH.
+- Push button (GPIO32): starts drying from IDLE, starts sealing from the dry-confirmed state.
+- Buzzer (GPIO33): 3 beeps when drying completes, 2 beeps when sealing completes.
+- Main switch: master power ON/OFF, in series with the 12V bus — not wired to the ESP32.
+
+## Recommended Assembly & Test Order
+
+1. Wire and test the power chain alone (panel → controller → battery → switch → buck converter); confirm 5V and 12V rails with a multimeter before connecting anything else.
+2. Wire ESP32 + LCD + push button + buzzer; flash a blank test sketch to confirm boot and LCD backlight.
+3. Add both DHT22 sensors and verify readings over Serial Monitor.
+4. Add the load cell + HX711; run the calibration sketch before trusting any weight number.
+5. Wire the 3 relay modules with no loads connected yet; verify each GPIO toggles its relay's click/LED correctly.
+6. Connect the heater and fan to Relay 1/2; test each independently at low duration first.
+7. Build and mount the sealing bar/nichrome strip; wire to Relay 3 and bench-test a short pulse on scrap pouch material before full integration.
+8. Assemble the chamber, mount all sensors/actuators in place, then run the full sketch end-to-end.
+
+## Safety Checklist
+
+- Fuse the 12V line immediately after the battery.
+- Physically shield the heater and sealer element from direct contact with the pouches / artisan's hands.
+- Firmware includes a 55°C hard cutoff as a backup — not a substitute for a physical thermal fuse on the heater if available.
+- Common ground across every module is mandatory; floating grounds are the most common cause of erratic sensor/relay behaviour.
+- Double-check relay trigger polarity (active-LOW vs active-HIGH) for your specific relay module before powering the 12V side.
+
+## Load Cell Calibration
+
+Run the calibration sketch (see `/firmware` or wherever the calibration code lives in this repo) with a known reference weight before relying on any weight reading. It tares the scale, takes a raw reading against the known weight, and computes a calibration factor to apply with `scale.set_scale()`.
+
+## Key Innovations
+
+- Two-factor dryness verification: weight loss of the agarbatti **plus** chamber temperature/humidity safe band.
+- Temperature-based duty-cycle heater control (ON below target temp, OFF at target, back ON as temp falls) — needed because the 10W solar panel can't sustain the heater continuously.
+
+## Target Impact
+
+Built for rural women artisans and Self-Help Groups (SHGs) engaged in home-based agarbatti production, aiming for faster (3–4h vs 6–8h traditional), all-weather, weight-verified drying with less manual supervision.
